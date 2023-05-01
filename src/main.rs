@@ -267,7 +267,7 @@ impl<'a> PlayMode<'a> {
         }
     }
 
-    fn redraw(&mut self, vram: &mut VRamManager) {
+    fn redraw(&mut self, data: &CommonGameData, vram: &mut VRamManager) {
         for y in 0..20 {
             let left_pos = Vector2D { x: 9, y };
             let right_pos = Vector2D { x: 20, y };
@@ -286,6 +286,19 @@ impl<'a> PlayMode<'a> {
                 get_global_tileset(),
                 tile_setting,
             );
+        }
+        for (i, row) in data.playfield.0[..20].iter().enumerate() {
+            for (j, block) in row.iter().enumerate() {
+                let screen_pos = Vector2D { x: (10 + j) as u16, y: (19 - i) as u16 };
+                let tile_id = if let Some(blk) = block {
+                    blk.index() as u16
+                } else {
+                    BLANK_TILE
+                };
+
+                let tile_setting = TileSetting::new(tile_id, false, false, 0);
+                self.locked_piece_background.set_tile(vram, screen_pos, get_global_tileset(), tile_setting)
+            }
         }
         self.locked_piece_background.show();
     }
@@ -321,7 +334,7 @@ struct Game<'a> {
 impl<'a> Game<'a> {
     fn redraw(&mut self, vram: &mut VRamManager) {
         match self.mode {
-            GameMode::Playing(ref mut play) => play.redraw(vram),
+            GameMode::Playing(ref mut play) => play.redraw(&self.data, vram),
             _ => (),
         }
     }
@@ -384,6 +397,10 @@ impl<'a> Game<'a> {
             }
         }
 
+        if !should_lock {
+            play.lock_delay = LOCK_DELAY_LEN;
+        }
+
         if should_lock && begin_piece != play.active_piece.data && play.lock_reset_count > 0 {
             play.lock_reset_count -= 1;
             play.lock_delay = LOCK_DELAY_LEN;
@@ -393,12 +410,19 @@ impl<'a> Game<'a> {
             for block in play.active_piece.data.current_rotation_data().hitbox {
                 let block_pos = play.active_piece.data.pos + block;
                 self.data.playfield.0[block_pos.row as usize][block_pos.column as usize] = Some(play.active_piece.data.which);
-                if block_pos.row < 20 {
-                    let screen_pos = Vector2D { x: (10 + block_pos.column) as u16, y: (19 - block_pos.row) as u16 };
-                    let tile_setting = TileSetting::new(play.active_piece.data.which.index() as u16, false, false, 0);
-                    play.locked_piece_background.set_tile(vram, screen_pos, get_global_tileset(), tile_setting);
+                self.data.dirty_screen = true;
+            }
+            
+            let mut new_playfield = Vec::with_capacity(40);
+
+            for row in self.data.playfield.0 {
+                if row.iter().any(Option::is_none) {
+                    new_playfield.push(row);
                 }
             }
+
+            new_playfield.resize(40, [None; 10]);
+            self.data.playfield.0.copy_from_slice(&new_playfield);
 
             play.active_piece.reroll(&mut self.data.rng);
             play.gravity_timer = GRAVITY_TIMER;
@@ -508,15 +532,17 @@ fn gen_piece_tile_data(index: u8) -> [u16; 16] {
 }
 
 const SOLID_TILE: u16 = 7;
+const BLANK_TILE: u16 = 8;
 
 fn get_global_tileset() -> &'static TileSet<'static> {
     static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
     fn gen_global_tileset() -> TileSet<'static> {
-        let mut tiles = Vec::with_capacity(16 * 8);
+        let mut tiles = Vec::with_capacity(16 * 9);
         for i in 0..7 {
             tiles.extend_from_slice(&gen_piece_tile_data(i));
         }
         tiles.resize(tiles.len() + 16, 0x2222);
+        tiles.resize(tiles.len() + 16, 0x0);
         TileSet::new(u16_slice_as_u8(tiles.leak()), TileFormat::FourBpp)
     }
 
