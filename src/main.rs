@@ -12,7 +12,7 @@ extern crate alloc;
 mod piece_data;
 mod util;
 
-use agb::display::object::{DynamicSprite, Object, ObjectController, PaletteVram, SpriteBorrow};
+use agb::display::object::{DynamicSprite, OamManaged, Object, PaletteVram, SpriteVram};
 use agb::display::palette16::Palette16;
 use agb::display::tiled::{
     MapLoan, RegularMap, TileFormat, TileSet, TileSetting, Tiled0, TiledMap, VRamManager,
@@ -187,7 +187,7 @@ struct ActivePiece<'a> {
 }
 
 impl<'a> ActivePiece<'a> {
-    fn new(oam: &'a ObjectController, rng: &mut RandomNumberGenerator) -> ActivePiece<'a> {
+    fn new(oam: &'a OamManaged, rng: &mut RandomNumberGenerator) -> ActivePiece<'a> {
         let mut falling_piece_objects = Vec::with_capacity(4);
         let falling_piece_sprites = get_falling_piece_sprites();
         for _ in 0..4 {
@@ -250,16 +250,13 @@ struct PlayMode<'a> {
 }
 
 impl<'a> PlayMode<'a> {
-    fn new(
-        oam: &'a ObjectController,
-        background: &'a Tiled0,
-        rng: &mut RandomNumberGenerator,
-    ) -> Self {
+    fn new(oam: &'a OamManaged, background: &'a Tiled0, rng: &mut RandomNumberGenerator) -> Self {
         Self {
             active_piece: ActivePiece::new(oam, rng),
             locked_piece_background: background.background(
                 display::Priority::P1,
                 display::tiled::RegularBackgroundSize::Background32x32,
+                TileFormat::FourBpp,
             ),
             gravity_timer: GRAVITY_TIMER,
             lock_delay: LOCK_DELAY_LEN,
@@ -485,7 +482,7 @@ impl<'a> Game<'a> {
 }
 
 impl<'a> Game<'a> {
-    fn new(oam: &'a ObjectController, background: &'a Tiled0) -> Self {
+    fn new(oam: &'a OamManaged, background: &'a Tiled0) -> Self {
         let mut rng = RandomNumberGenerator::new();
         let mode = GameMode::Playing(PlayMode::new(oam, background, &mut rng));
         Self {
@@ -585,9 +582,9 @@ fn get_global_tileset() -> &'static TileSet<'static> {
 }
 
 //Don't call from irq lul
-fn get_falling_piece_sprites() -> &'static [SpriteBorrow] {
-    static mut FALLING_PIECE_SPRITES: InitOnce<Vec<SpriteBorrow>> = InitOnce::new();
-    fn gen_falling_piece_sprites() -> Vec<SpriteBorrow> {
+fn get_falling_piece_sprites() -> &'static [SpriteVram] {
+    static mut FALLING_PIECE_SPRITES: InitOnce<Vec<SpriteVram>> = InitOnce::new();
+    fn gen_falling_piece_sprites() -> Vec<SpriteVram> {
         let falling_piece_palette = PaletteVram::new(&PIECE_PALETTE).unwrap();
         let mut falling_piece_sprites = Vec::with_capacity(7);
         for i in 0..7 {
@@ -605,7 +602,7 @@ fn get_falling_piece_sprites() -> &'static [SpriteBorrow] {
 
 #[agb::entry]
 fn main(mut gba: agb::Gba) -> ! {
-    let objects = gba.display.object.get();
+    let objects = gba.display.object.get_managed();
 
     let v_blank = interrupt::VBlank::get();
 
@@ -614,14 +611,11 @@ fn main(mut gba: agb::Gba) -> ! {
 
     fn assign_game_lifetimes<'a>(
         game: &'a mut MaybeUninit<Game<'static>>,
-        _object: &'a agb::display::object::ObjectController,
-        _background: &'a agb::display::tiled::Tiled0,
     ) -> &'a mut MaybeUninit<Game<'a>> {
         unsafe { core::mem::transmute(game) }
     }
 
-    let mut game = unsafe { assign_game_lifetimes(&mut GAME, &objects, &tiled) }
-        .write(Game::new(&objects, &tiled));
+    let mut game = unsafe { assign_game_lifetimes(&mut GAME) }.write(Game::new(&objects, &tiled));
 
     let mut debug_indicator = objects.object(get_falling_piece_sprites()[0].clone());
     debug_indicator.set_x(0);
