@@ -12,20 +12,25 @@ extern crate alloc;
 mod piece_data;
 mod util;
 
-use agb::display::object::{DynamicSprite, Object, PaletteVram, SpriteBorrow};
+use agb::display::object::{DynamicSprite, Object, ObjectController, PaletteVram, SpriteBorrow};
 use agb::display::palette16::Palette16;
-use agb::display::tiled::{TileFormat, TileSet, TileSetting, TiledMap};
+use agb::display::tiled::{
+    MapLoan, RegularMap, TileFormat, TileSet, TileSetting, Tiled0, TiledMap, VRamManager,
+};
 use agb::fixnum::Vector2D;
 use agb::input::{Button, ButtonController};
 use agb::sync::InitOnce;
-use agb::{display, interrupt, sync};
+use agb::{display, interrupt};
+use agb::rng::RandomNumberGenerator;
 use alloc::vec::Vec;
+use core::cmp::min;
 use core::convert::TryInto;
+use core::mem::MaybeUninit;
 use core::ops;
 use piece_data::{PieceData, PIECE_DATA};
 use util::{html_color_to_gba, u16_slice_as_u8};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Pos {
     row: i8,
     column: i8,
@@ -97,39 +102,30 @@ impl Piece {
     }
 }
 
-#[derive(Copy, Clone)]
-struct ActivePiece {
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct ActivePieceData {
     which: Piece,
     rotation: u8,
     pos: Pos,
 }
 
-impl ActivePiece {
-    fn current_rotation_data(&self) -> &'static Rotation {
-        &self.which.data().rotations[self.rotation as usize]
+impl ActivePieceData {
+    fn new(rng: &mut RandomNumberGenerator) -> ActivePieceData {
+        let which = Piece::from_index((rng.gen() as usize) % 7);
+        let row = if which == Piece::I {
+            17
+        } else {
+            18
+        };
+        ActivePieceData {
+            which,
+            rotation: 0,
+            pos: Pos { row, column: 3 },
+        }
     }
 
-    fn draw(
-        &self,
-        sprites: &[SpriteBorrow],
-        objects: &mut [Object],
-        playfield_x: u16,
-        playfield_y: u16,
-    ) {
-        for (block, object) in self
-            .current_rotation_data()
-            .hitbox
-            .iter()
-            .zip(objects.iter_mut())
-        {
-            let screen_x =
-                (((block.column + self.pos.column) as i16 * 8) + (playfield_x as i16)) as u16;
-            let screen_y = (((block.row + self.pos.row) as i16 * 8) + (playfield_y as i16)) as u16;
-
-            object.set_y(160_u16.wrapping_sub(screen_y + 8));
-            object.set_x(screen_x);
-            object.set_sprite(sprites[self.which.index()].clone());
-        }
+    fn current_rotation_data(&self) -> &'static Rotation {
+        &self.which.data().rotations[self.rotation as usize]
     }
 
     fn blocked_inner(&self, field: &PlayField) -> Option<()> {
@@ -189,21 +185,265 @@ impl ActivePiece {
     }
 }
 
-struct PlayField(pub [[Option<Piece>; 10]; 40]);
-
-struct Game {
-    playfield: PlayField,
+struct ActivePiece<'a> {
+    data: ActivePieceData,
+    objects: Vec<Object<'a>>,
 }
 
-impl Game {
-    fn new() -> Self {
-        Self {
-            playfield: PlayField([[None; 10]; 40]),
+impl<'a> ActivePiece<'a> {
+    fn new(oam: &'a ObjectController, rng: &mut RandomNumberGenerator) -> ActivePiece<'a> {
+        let mut falling_piece_objects = Vec::with_capacity(4);
+        let falling_piece_sprites = get_falling_piece_sprites();
+        for _ in 0..4 {
+            falling_piece_objects.push(oam.object(falling_piece_sprites[0].clone()));
+        }
+        let mut ret = ActivePiece {
+            data: ActivePieceData::new(rng),
+            objects: falling_piece_objects,
+        };
+
+        ret.update_color();
+        ret
+    }
+
+    fn update_color(&mut self) {
+        let falling_piece_sprites = get_falling_piece_sprites();
+        for obj in &mut self.objects {
+            obj.set_sprite(falling_piece_sprites[self.data.which.index()].clone());
+        }
+    }
+
+    fn reroll(&mut self, rng: &mut RandomNumberGenerator) {
+        self.data = ActivePieceData::new(rng);
+        self.update_color();
+    }
+
+    fn draw(&mut self, playfield_x: u16, playfield_y: u16) {
+        for (block, object) in self
+            .data
+            .current_rotation_data()
+            .hitbox
+            .iter()
+            .zip(self.objects.iter_mut())
+        {
+            let sprites = get_falling_piece_sprites();
+            let screen_x =
+                (((block.column + self.data.pos.column) as i16 * 8) + (playfield_x as i16)) as u16;
+            let screen_y =
+                (((block.row + self.data.pos.row) as i16 * 8) + (playfield_y as i16)) as u16;
+
+            object.set_y(160_u16.wrapping_sub(screen_y + 8));
+            object.set_x(screen_x);
+            object.set_sprite(sprites[self.data.which.index()].clone());
         }
     }
 }
 
-static GAME: sync::InitOnce<sync::Mutex<Game>> = sync::InitOnce::new();
+struct PlayField(pub [[Option<Piece>; 10]; 40]);
+
+const GRAVITY_TIMER: u16 = 60 * 3;
+const LOCK_DELAY_LEN: u16 = 60;
+const LOCK_RESET_COUNT: u8 = 20;
+
+struct PlayMode<'a> {
+    active_piece: ActivePiece<'a>,
+    locked_piece_background: MapLoan<'a, RegularMap>,
+    gravity_timer: u16,
+    lock_delay: u16,
+    lock_reset_count: u8,
+}
+
+impl<'a> PlayMode<'a> {
+    fn new(oam: &'a ObjectController, background: &'a Tiled0, rng: &mut RandomNumberGenerator) -> Self {
+        Self {
+            active_piece: ActivePiece::new(oam, rng),
+            locked_piece_background: background.background(
+                display::Priority::P1,
+                display::tiled::RegularBackgroundSize::Background32x32,
+            ),
+            gravity_timer: GRAVITY_TIMER,
+            lock_delay: LOCK_DELAY_LEN,
+            lock_reset_count: LOCK_RESET_COUNT,
+        }
+    }
+
+    fn redraw(&mut self, vram: &mut VRamManager) {
+        for y in 0..20 {
+            let left_pos = Vector2D { x: 9, y };
+            let right_pos = Vector2D { x: 20, y };
+
+            let tile_setting = TileSetting::new(SOLID_TILE, false, false, 1);
+
+            self.locked_piece_background.set_tile(
+                vram,
+                left_pos,
+                get_global_tileset(),
+                tile_setting,
+            );
+            self.locked_piece_background.set_tile(
+                vram,
+                right_pos,
+                get_global_tileset(),
+                tile_setting,
+            );
+        }
+        self.locked_piece_background.show();
+    }
+
+    fn sprite_draw(&mut self, vram: &mut VRamManager) {
+        self.active_piece.draw(80, 0);
+    }
+
+    fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
+        self.locked_piece_background.commit(vram);
+    }
+}
+
+enum GameMode<'a> {
+    Blank,
+    Playing(PlayMode<'a>),
+}
+
+struct CommonGameData {
+    playfield: PlayField,
+    debug_active: bool,
+    dirty_screen: bool,
+    level: u8,
+    input: ButtonController,
+    rng: RandomNumberGenerator,
+}
+
+struct Game<'a> {
+    data: CommonGameData,
+    mode: GameMode<'a>,
+}
+
+impl<'a> Game<'a> {
+    fn redraw(&mut self, vram: &mut VRamManager) {
+        match self.mode {
+            GameMode::Playing(ref mut play) => play.redraw(vram),
+            _ => (),
+        }
+    }
+
+    fn sprite_draw(&mut self, vram: &mut VRamManager) {
+        match self.mode {
+            GameMode::Playing(ref mut play) => play.sprite_draw(vram),
+            _ => (),
+        }
+    }
+
+    fn play_tick(&mut self, vram: &mut VRamManager) {
+        let mut should_lock = false;
+        let mut play = match self.mode {
+            GameMode::Playing(ref mut play) => play,
+                _ => panic!(),
+        };
+        let begin_piece = play.active_piece.data;
+
+        if self.data.input.is_just_pressed(Button::A) {
+            play.active_piece.data.clockwise_rotate(&self.data.playfield);
+        } else if self.data.input.is_just_pressed(Button::B) {
+            play.active_piece.data.counter_clockwise_rotate(&self.data.playfield);
+        } else if self.data.input.is_just_pressed(Button::LEFT) {
+            play.active_piece.data.shift(&self.data.playfield, Pos { row: 0, column: -1 });
+        } else if self.data.input.is_just_pressed(Button::RIGHT) {
+            play.active_piece.data.shift(&self.data.playfield, Pos { row: 0, column: 1 });
+        }
+
+        if self.data.debug_active {
+            if self.data.input.is_just_pressed(Button::UP) {
+                play.active_piece.data.shift(&self.data.playfield, Pos { row: 1, column: 0 });
+            } else if self.data.input.is_just_pressed(Button::L) {
+                play.active_piece.data.which =
+                    Piece::from_index(play.active_piece.data.which.index().checked_sub(1).unwrap_or(6));
+                play.active_piece.data.rotation = 0;
+            } else if self.data.input.is_just_pressed(Button::R) {
+                play.active_piece.data.which = Piece::from_index((play.active_piece.data.which.index() + 1) % 7);
+                play.active_piece.data.rotation = 0;
+            } else if self.data.input.is_just_pressed(Button::DOWN) {
+                should_lock = !play.active_piece.data.shift(&self.data.playfield, Pos { row: -1, column: 0 });
+            }
+        } else {
+            if self.data.input.is_pressed(Button::DOWN) {
+                play.gravity_timer = min(play.gravity_timer, 2);
+            } else if self.data.input.is_just_pressed(Button::UP) {
+                while play.active_piece.data.shift(&self.data.playfield, Pos { row: -1, column: 0 }) {}
+                should_lock = true;
+                play.lock_reset_count = 0;
+                play.lock_delay = 0;
+            }
+
+            if play.gravity_timer == 0 {
+                should_lock = !play.active_piece.data.shift(&self.data.playfield, Pos { row: -1, column: 0 });
+                if !should_lock {
+                    play.gravity_timer = GRAVITY_TIMER;
+                }
+            } else {
+                play.gravity_timer -= 1;
+            }
+        }
+
+        if should_lock && begin_piece != play.active_piece.data && play.lock_reset_count > 0 {
+            play.lock_reset_count -= 1;
+            play.lock_delay = LOCK_DELAY_LEN;
+        }
+
+        if should_lock && play.lock_delay == 0 {
+            for block in play.active_piece.data.current_rotation_data().hitbox {
+                let block_pos = play.active_piece.data.pos + block;
+                self.data.playfield.0[block_pos.row as usize][block_pos.column as usize] = Some(play.active_piece.data.which);
+                if block_pos.row < 20 {
+                    let screen_pos = Vector2D { x: (10 + block_pos.column) as u16, y: (19 - block_pos.row) as u16 };
+                    let tile_setting = TileSetting::new(play.active_piece.data.which.index() as u16, false, false, 0);
+                    play.locked_piece_background.set_tile(vram, screen_pos, get_global_tileset(), tile_setting);
+                }
+            }
+
+            play.active_piece.reroll(&mut self.data.rng);
+            play.gravity_timer = GRAVITY_TIMER;
+            play.lock_delay = LOCK_DELAY_LEN;
+            play.lock_reset_count = LOCK_RESET_COUNT;
+        } else if should_lock {
+            play.lock_delay -= 1;
+        }
+
+    }
+
+    fn tick(&mut self, vram: &mut VRamManager) {
+        match self.mode {
+            GameMode::Playing(_) => self.play_tick(vram),
+            _ => (),
+        }
+    }
+
+    fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
+        match self.mode {
+            GameMode::Playing(ref mut play) => play.commit_backgrounds(vram),
+            _ => (),
+        }
+    }
+}
+
+impl<'a> Game<'a> {
+    fn new(oam: &'a ObjectController, background: &'a Tiled0) -> Self {
+        let mut rng = RandomNumberGenerator::new();
+        let mode = GameMode::Playing(PlayMode::new(oam, background, &mut rng));
+        Self {
+            data: CommonGameData {
+                input: ButtonController::new(),
+                playfield: PlayField([[None; 10]; 40]),
+                debug_active: false,
+                dirty_screen: true,
+                level: 0,
+                rng,
+            },
+            mode,
+        }
+    }
+}
+
+static mut GAME: MaybeUninit<Game<'static>> = MaybeUninit::uninit();
 
 const fn gen_piece_palette() -> Palette16 {
     let palette = [
@@ -267,97 +507,88 @@ fn gen_piece_tile_data(index: u8) -> [u16; 16] {
     tiles
 }
 
-fn gen_global_tileset() -> TileSet<'static> {
-    let mut tiles = Vec::with_capacity(16 * 8);
-    for i in 0..7 {
-        tiles.extend_from_slice(&gen_piece_tile_data(i));
-    }
-    tiles.resize(tiles.len() + 16, 0x2222);
-    TileSet::new(u16_slice_as_u8(tiles.leak()), TileFormat::FourBpp)
-}
-
 const SOLID_TILE: u16 = 7;
 
-static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
-
 fn get_global_tileset() -> &'static TileSet<'static> {
+    static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
+    fn gen_global_tileset() -> TileSet<'static> {
+        let mut tiles = Vec::with_capacity(16 * 8);
+        for i in 0..7 {
+            tiles.extend_from_slice(&gen_piece_tile_data(i));
+        }
+        tiles.resize(tiles.len() + 16, 0x2222);
+        TileSet::new(u16_slice_as_u8(tiles.leak()), TileFormat::FourBpp)
+    }
+
     GLOBAL_TILESET.get(gen_global_tileset)
+}
+
+//Don't call from irq lul
+fn get_falling_piece_sprites() -> &'static [SpriteBorrow] {
+    static mut FALLING_PIECE_SPRITES: InitOnce<Vec<SpriteBorrow>> = InitOnce::new();
+    fn gen_falling_piece_sprites() -> Vec<SpriteBorrow> {
+        let falling_piece_palette = PaletteVram::new(&PIECE_PALETTE).unwrap();
+        let mut falling_piece_sprites = Vec::with_capacity(7);
+        for i in 0..7 {
+            let tile_data = gen_piece_tile_data(i);
+            let sprite =
+                DynamicSprite::new(u16_slice_as_u8(&tile_data), display::object::Size::S8x8)
+                    .to_vram(falling_piece_palette.clone());
+            falling_piece_sprites.push(sprite);
+        }
+        falling_piece_sprites
+    }
+
+    unsafe { FALLING_PIECE_SPRITES.get(gen_falling_piece_sprites) }
 }
 
 #[agb::entry]
 fn main(mut gba: agb::Gba) -> ! {
-    let game_mutex = GAME.get(|| sync::Mutex::new(Game::new()));
-    let game = game_mutex.lock();
-    let falling_piece_palette = PaletteVram::new(&PIECE_PALETTE).unwrap();
-    let mut falling_piece_sprites = Vec::with_capacity(7);
-    for i in 0..7 {
-        let tile_data = gen_piece_tile_data(i);
-        let sprite = DynamicSprite::new(u16_slice_as_u8(&tile_data), display::object::Size::S8x8)
-            .to_vram(falling_piece_palette.clone());
-        falling_piece_sprites.push(sprite);
-    }
-
     let objects = gba.display.object.get();
-    let mut falling_piece_objects = Vec::with_capacity(4);
-    for _ in 0..4 {
-        falling_piece_objects.push(objects.object(falling_piece_sprites[0].clone()));
-    }
-
-    let mut active_piece = ActivePiece {
-        which: Piece::I,
-        rotation: 0,
-        pos: Pos { row: 0, column: 3 },
-    };
 
     let v_blank = interrupt::VBlank::get();
 
-    let mut input = ButtonController::new();
-
     let (tiled, mut vram) = gba.display.video.tiled0();
     vram.set_background_palettes(GLOBAL_TILE_PALETTES);
-    let mut background0 = tiled.background(
-        display::Priority::P1,
-        display::tiled::RegularBackgroundSize::Background32x32,
-    );
-    for y in 0..20 {
-        let left_pos = Vector2D { x: 9, y };
-        let right_pos = Vector2D { x: 20, y };
 
-        let tile_setting = TileSetting::new(SOLID_TILE, false, false, 1);
-
-        background0.set_tile(&mut vram, left_pos, get_global_tileset(), tile_setting);
-        background0.set_tile(&mut vram, right_pos, get_global_tileset(), tile_setting);
+    fn assign_game_lifetimes<'a>(
+        game: &'a mut MaybeUninit<Game<'static>>,
+        _object: &'a agb::display::object::ObjectController,
+        _background: &'a agb::display::tiled::Tiled0,
+    ) -> &'a mut MaybeUninit<Game<'a>> {
+        unsafe { core::mem::transmute(game) }
     }
-    background0.commit(&mut vram);
-    background0.show();
+
+    let mut game = unsafe { assign_game_lifetimes(&mut GAME, &objects, &tiled) }.write(Game::new(&objects, &tiled));
+
+    let mut debug_indicator = objects.object(get_falling_piece_sprites()[0].clone());
+    debug_indicator.set_x(0);
+    debug_indicator.set_y(0);
+    debug_indicator.hide();
 
     loop {
-        input.update();
-
-        if input.is_just_pressed(Button::A) {
-            active_piece.clockwise_rotate(&game.playfield);
-        } else if input.is_just_pressed(Button::B) {
-            active_piece.counter_clockwise_rotate(&game.playfield);
-        } else if input.is_just_pressed(Button::L) {
-            active_piece.which =
-                Piece::from_index(active_piece.which.index().checked_sub(1).unwrap_or(6));
-            active_piece.rotation = 0;
-        } else if input.is_just_pressed(Button::R) {
-            active_piece.which = Piece::from_index((active_piece.which.index() + 1) % 7);
-            active_piece.rotation = 0;
-        } else if input.is_just_pressed(Button::LEFT) {
-            active_piece.shift(&game.playfield, Pos { row: 0, column: -1 });
-        } else if input.is_just_pressed(Button::RIGHT) {
-            active_piece.shift(&game.playfield, Pos { row: 0, column: 1 });
-        } else if input.is_just_pressed(Button::UP) {
-            active_piece.shift(&game.playfield, Pos { row: 1, column: 0 });
-        } else if input.is_just_pressed(Button::DOWN) {
-            active_piece.shift(&game.playfield, Pos { row: -1, column: 0 });
+        game.data.rng.gen();
+        game.data.input.update();
+        if game.data.input.is_just_pressed(Button::SELECT) {
+            game.data.debug_active = !game.data.debug_active;
+            if game.data.debug_active {
+                debug_indicator.show();
+            } else {
+                debug_indicator.hide();
+            }
         }
 
-        active_piece.draw(&falling_piece_sprites, &mut falling_piece_objects, 80, 0);
+        game.tick(&mut vram);
+
+        if game.data.dirty_screen {
+            game.data.dirty_screen = false;
+            game.redraw(&mut vram);
+        }
+
+        game.sprite_draw(&mut vram);
 
         v_blank.wait_for_vblank();
         objects.commit();
+        game.commit_backgrounds(&mut vram);
     }
 }
