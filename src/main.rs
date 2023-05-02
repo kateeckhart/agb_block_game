@@ -21,7 +21,6 @@ use agb::fixnum::Vector2D;
 use agb::input::{Button, ButtonController};
 use agb::sync::InitOnce;
 use agb::{display, interrupt};
-use alloc::vec::Vec;
 use core::cmp::min;
 use core::convert::TryInto;
 use core::mem::MaybeUninit;
@@ -29,6 +28,7 @@ use core::ops;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use piece_data::{PieceData, PIECE_DATA};
+use smallvec::{SmallVec, smallvec_inline};
 use util::{html_color_to_gba, u16_slice_as_u8};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -184,12 +184,12 @@ impl ActivePieceData {
 
 struct ActivePiece<'a> {
     data: ActivePieceData,
-    objects: Vec<Object<'a>>,
+    objects: SmallVec<[Object<'a>; 4]>,
 }
 
 impl<'a> ActivePiece<'a> {
     fn new(oam: &'a OamManaged, bag: &mut PieceBag) -> ActivePiece<'a> {
-        let mut falling_piece_objects = Vec::with_capacity(4);
+        let mut falling_piece_objects = SmallVec::new();
         let falling_piece_sprites = get_falling_piece_sprites();
         for _ in 0..4 {
             falling_piece_objects.push(oam.object(falling_piece_sprites[0].clone()));
@@ -237,7 +237,7 @@ impl<'a> ActivePiece<'a> {
     }
 }
 
-struct PlayField(pub [[Option<Piece>; 10]; 40]);
+struct PlayField(pub SmallVec<[[Option<Piece>; 10]; 40]>);
 
 const GRAVITY_TIMER: u16 = 60 * 3;
 const LOCK_DELAY_LEN: u16 = 60;
@@ -326,14 +326,14 @@ enum GameMode<'a> {
 
 struct PieceBag {
     rng: ChaCha8Rng,
-    bag: Vec<Piece>,
+    bag: SmallVec<[Piece; 7]>,
 }
 
 impl PieceBag {
     fn new() -> Self {
         Self {
             rng: ChaCha8Rng::from_seed(*include_bytes!("seed.bin")),
-            bag: Vec::with_capacity(7),
+            bag: SmallVec::new(),
         }
     }
 
@@ -475,16 +475,9 @@ impl<'a> Game<'a> {
                 self.data.dirty_screen = true;
             }
 
-            let mut new_playfield = Vec::with_capacity(40);
+            self.data.playfield.0.retain(|row| row.iter().any(Option::is_none));
 
-            for row in self.data.playfield.0 {
-                if row.iter().any(Option::is_none) {
-                    new_playfield.push(row);
-                }
-            }
-
-            new_playfield.resize(40, [None; 10]);
-            self.data.playfield.0.copy_from_slice(&new_playfield);
+            self.data.playfield.0.resize(40, [None; 10]);
 
             play.active_piece.reroll(&mut self.data.bag);
             play.gravity_timer = GRAVITY_TIMER;
@@ -517,7 +510,7 @@ impl<'a> Game<'a> {
         Self {
             data: CommonGameData {
                 input: ButtonController::new(),
-                playfield: PlayField([[None; 10]; 40]),
+                playfield: PlayField(smallvec_inline![[None; 10]; 40]),
                 debug_active: false,
                 dirty_screen: true,
                 level: 0,
@@ -597,14 +590,17 @@ const BLANK_TILE: u16 = 8;
 
 fn get_global_tileset() -> &'static TileSet<'static> {
     static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
+    static mut TILESTORE: SmallVec<[u16; 16 * 9]> = SmallVec::new_const();
     fn gen_global_tileset() -> TileSet<'static> {
-        let mut tiles = Vec::with_capacity(16 * 9);
+        let mut tiles = unsafe {
+            &mut TILESTORE
+        };
         for i in 0..7 {
             tiles.extend_from_slice(&gen_piece_tile_data(i));
         }
         tiles.resize(tiles.len() + 16, 0x2222);
         tiles.resize(tiles.len() + 16, 0x0);
-        TileSet::new(u16_slice_as_u8(tiles.leak()), TileFormat::FourBpp)
+        TileSet::new(u16_slice_as_u8(tiles), TileFormat::FourBpp)
     }
 
     GLOBAL_TILESET.get(gen_global_tileset)
@@ -612,10 +608,10 @@ fn get_global_tileset() -> &'static TileSet<'static> {
 
 //Don't call from irq lul
 fn get_falling_piece_sprites() -> &'static [SpriteVram] {
-    static mut FALLING_PIECE_SPRITES: InitOnce<Vec<SpriteVram>> = InitOnce::new();
-    fn gen_falling_piece_sprites() -> Vec<SpriteVram> {
+    static mut FALLING_PIECE_SPRITES: InitOnce<SmallVec<[SpriteVram; 7]>> = InitOnce::new();
+    fn gen_falling_piece_sprites() -> SmallVec<[SpriteVram; 7]> {
         let falling_piece_palette = PaletteVram::new(&PIECE_PALETTE).unwrap();
-        let mut falling_piece_sprites = Vec::with_capacity(7);
+        let mut falling_piece_sprites = SmallVec::new();
         for i in 0..7 {
             let tile_data = gen_piece_tile_data(i);
             let sprite =
