@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 agb = "0.15.0"
 rand = { version = "0.8", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
 
 [profile.dev]
 opt-level = 2

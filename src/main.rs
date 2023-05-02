@@ -19,7 +19,6 @@ use agb::display::tiled::{
 };
 use agb::fixnum::Vector2D;
 use agb::input::{Button, ButtonController};
-use agb::rng::RandomNumberGenerator;
 use agb::sync::InitOnce;
 use agb::{display, interrupt};
 use alloc::vec::Vec;
@@ -27,6 +26,8 @@ use core::cmp::min;
 use core::convert::TryInto;
 use core::mem::MaybeUninit;
 use core::ops;
+use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use piece_data::{PieceData, PIECE_DATA};
 use util::{html_color_to_gba, u16_slice_as_u8};
 
@@ -110,8 +111,8 @@ struct ActivePieceData {
 }
 
 impl ActivePieceData {
-    fn new(rng: &mut RandomNumberGenerator) -> ActivePieceData {
-        let which = Piece::from_index((rng.gen() as usize) % 7);
+    fn new(bag: &mut PieceBag) -> ActivePieceData {
+        let which = bag.next();
         let row = if which == Piece::I { 17 } else { 18 };
         ActivePieceData {
             which,
@@ -187,14 +188,14 @@ struct ActivePiece<'a> {
 }
 
 impl<'a> ActivePiece<'a> {
-    fn new(oam: &'a OamManaged, rng: &mut RandomNumberGenerator) -> ActivePiece<'a> {
+    fn new(oam: &'a OamManaged, bag: &mut PieceBag) -> ActivePiece<'a> {
         let mut falling_piece_objects = Vec::with_capacity(4);
         let falling_piece_sprites = get_falling_piece_sprites();
         for _ in 0..4 {
             falling_piece_objects.push(oam.object(falling_piece_sprites[0].clone()));
         }
         let mut ret = ActivePiece {
-            data: ActivePieceData::new(rng),
+            data: ActivePieceData::new(bag),
             objects: falling_piece_objects,
         };
 
@@ -209,8 +210,8 @@ impl<'a> ActivePiece<'a> {
         }
     }
 
-    fn reroll(&mut self, rng: &mut RandomNumberGenerator) {
-        self.data = ActivePieceData::new(rng);
+    fn reroll(&mut self, bag: &mut PieceBag) {
+        self.data = ActivePieceData::new(bag);
         self.update_color();
     }
 
@@ -231,6 +232,7 @@ impl<'a> ActivePiece<'a> {
             object.set_y(160_u16.wrapping_sub(screen_y + 8));
             object.set_x(screen_x);
             object.set_sprite(sprites[self.data.which.index()].clone());
+            object.show();
         }
     }
 }
@@ -250,9 +252,9 @@ struct PlayMode<'a> {
 }
 
 impl<'a> PlayMode<'a> {
-    fn new(oam: &'a OamManaged, background: &'a Tiled0, rng: &mut RandomNumberGenerator) -> Self {
+    fn new(oam: &'a OamManaged, background: &'a Tiled0, bag: &mut PieceBag) -> Self {
         Self {
-            active_piece: ActivePiece::new(oam, rng),
+            active_piece: ActivePiece::new(oam, bag),
             locked_piece_background: background.background(
                 display::Priority::P1,
                 display::tiled::RegularBackgroundSize::Background32x32,
@@ -322,13 +324,40 @@ enum GameMode<'a> {
     Playing(PlayMode<'a>),
 }
 
+struct PieceBag {
+    rng: ChaCha8Rng,
+    bag: Vec<Piece>,
+}
+
+impl PieceBag {
+    fn new() -> Self {
+        Self {
+            rng: ChaCha8Rng::from_seed(*include_bytes!("seed.bin")),
+            bag: Vec::with_capacity(7),
+        }
+    }
+
+    fn next(&mut self) -> Piece {
+        if let Some(piece) = self.bag.pop() {
+            return piece;
+        }
+
+        for i in 0..7 {
+            self.bag.push(Piece::from_index(i));
+        }
+
+        self.bag.shuffle(&mut self.rng);
+        self.bag.pop().unwrap()
+    }
+}
+
 struct CommonGameData {
     playfield: PlayField,
     debug_active: bool,
     dirty_screen: bool,
     level: u8,
     input: ButtonController,
-    rng: RandomNumberGenerator,
+    bag: PieceBag,
 }
 
 struct Game<'a> {
@@ -457,7 +486,7 @@ impl<'a> Game<'a> {
             new_playfield.resize(40, [None; 10]);
             self.data.playfield.0.copy_from_slice(&new_playfield);
 
-            play.active_piece.reroll(&mut self.data.rng);
+            play.active_piece.reroll(&mut self.data.bag);
             play.gravity_timer = GRAVITY_TIMER;
             play.lock_delay = LOCK_DELAY_LEN;
             play.lock_reset_count = LOCK_RESET_COUNT;
@@ -483,8 +512,8 @@ impl<'a> Game<'a> {
 
 impl<'a> Game<'a> {
     fn new(oam: &'a OamManaged, background: &'a Tiled0) -> Self {
-        let mut rng = RandomNumberGenerator::new();
-        let mode = GameMode::Playing(PlayMode::new(oam, background, &mut rng));
+        let mut bag = PieceBag::new();
+        let mode = GameMode::Playing(PlayMode::new(oam, background, &mut bag));
         Self {
             data: CommonGameData {
                 input: ButtonController::new(),
@@ -492,7 +521,7 @@ impl<'a> Game<'a> {
                 debug_active: false,
                 dirty_screen: true,
                 level: 0,
-                rng,
+                bag,
             },
             mode,
         }
@@ -623,7 +652,7 @@ fn main(mut gba: agb::Gba) -> ! {
     debug_indicator.hide();
 
     loop {
-        game.data.rng.gen();
+        game.data.bag.rng.next_u32();
         game.data.input.update();
         if game.data.input.is_just_pressed(Button::SELECT) {
             game.data.debug_active = !game.data.debug_active;
