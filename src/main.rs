@@ -17,19 +17,19 @@ use agb::display::tiled::{
     MapLoan, RegularMap, TileFormat, TileSet, TileSetting, Tiled0, TiledMap, VRamManager,
 };
 use agb::fixnum::Vector2D;
+use agb::include_font;
 use agb::input::{Button, ButtonController};
 use agb::sync::InitOnce;
 use agb::{display, interrupt};
-use agb::include_font;
 use core::cmp::min;
 use core::convert::TryInto;
 use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops;
+use piece_data::{PieceData, PIECE_DATA};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
-use piece_data::{PieceData, PIECE_DATA};
-use smallvec::{SmallVec, smallvec_inline};
+use smallvec::{smallvec_inline, SmallVec};
 use util::{html_color_to_gba, u16_slice_as_u8};
 
 static BIG_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 24);
@@ -66,7 +66,7 @@ struct Rotation {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-enum Piece {
+enum BasePiece {
     I,
     O,
     L,
@@ -76,40 +76,111 @@ enum Piece {
     Z,
 }
 
-impl Piece {
+impl BasePiece {
     fn index(self) -> usize {
         match self {
-            Piece::I => 0,
-            Piece::O => 1,
-            Piece::L => 2,
-            Piece::J => 3,
-            Piece::T => 4,
-            Piece::S => 5,
-            Piece::Z => 6,
+            BasePiece::I => 0,
+            BasePiece::O => 1,
+            BasePiece::L => 2,
+            BasePiece::J => 3,
+            BasePiece::T => 4,
+            BasePiece::S => 5,
+            BasePiece::Z => 6,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum LockedPiece {
+    Empty,
+    Base(BasePiece),
+    Garbage,
+}
+
+impl LockedPiece {
+    fn tile_index(self) -> u16 {
+        match self {
+            LockedPiece::Empty => BLANK_TILE,
+            LockedPiece::Base(piece) => piece.index() as u16,
+            LockedPiece::Garbage => 1,
         }
     }
 
-    fn from_index(idx: usize) -> Self {
-        match idx {
-            0 => Piece::I,
-            1 => Piece::O,
-            2 => Piece::L,
-            3 => Piece::J,
-            4 => Piece::T,
-            5 => Piece::S,
-            6 => Piece::Z,
-            _ => panic!("Invalid piece index"),
+    fn pal_index(self) -> u8 {
+        match self {
+            LockedPiece::Empty => 0,
+            LockedPiece::Base(_) => 1,
+            LockedPiece::Garbage => 2,
         }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ActivePieceType {
+    Base(BasePiece),
+    Ghost(BasePiece),
+}
+
+const fn gen_full_bag() -> [ActivePieceType; 7] {
+    use ActivePieceType::Base as B;
+    use BasePiece::*;
+
+    [B(I), B(O), B(L), B(J), B(T), B(S), B(Z)]
+}
+
+const FULL_BAG: [ActivePieceType; 7] = gen_full_bag();
+
+impl ActivePieceType {
+    fn base(self) -> BasePiece {
+        match self {
+            ActivePieceType::Base(piece) | ActivePieceType::Ghost(piece) => piece,
+        }
+    }
+
+    fn lock(self) -> LockedPiece {
+        LockedPiece::Base(self.base())
+    }
+
+    fn sprite(self) -> &'static SpriteVram {
+        let sprites = get_falling_piece_sprites();
+        match self {
+            ActivePieceType::Base(piece) => &sprites[piece.index()],
+            ActivePieceType::Ghost(_) => &sprites[7],
+        }
+    }
+
+    fn debug_next(self) -> Self {
+        ActivePieceType::Base(match self.base() {
+            BasePiece::I => BasePiece::O,
+            BasePiece::O => BasePiece::L,
+            BasePiece::L => BasePiece::J,
+            BasePiece::J => BasePiece::T,
+            BasePiece::T => BasePiece::S,
+            BasePiece::S => BasePiece::Z,
+            BasePiece::Z => BasePiece::I,
+        })
+    }
+
+    fn debug_prev(self) -> Self {
+        ActivePieceType::Base(match self.base() {
+            BasePiece::I => BasePiece::Z,
+            BasePiece::O => BasePiece::I,
+            BasePiece::L => BasePiece::O,
+            BasePiece::J => BasePiece::L,
+            BasePiece::T => BasePiece::J,
+            BasePiece::S => BasePiece::T,
+            BasePiece::Z => BasePiece::S,
+        })
     }
 
     fn data(self) -> &'static PieceData {
-        &PIECE_DATA[self.index()]
+        &PIECE_DATA[self.base().index()]
     }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct ActivePieceData {
-    which: Piece,
+    which: ActivePieceType,
     rotation: u8,
     pos: Pos,
 }
@@ -117,7 +188,11 @@ struct ActivePieceData {
 impl ActivePieceData {
     fn new(bag: &mut PieceBag) -> ActivePieceData {
         let which = bag.next();
-        let row = if which == Piece::I { 17 } else { 18 };
+        let row = if which == ActivePieceType::Base(BasePiece::I) {
+            17
+        } else {
+            18
+        };
         ActivePieceData {
             which,
             rotation: 0,
@@ -134,7 +209,7 @@ impl ActivePieceData {
             let block_pos = self.pos + block;
             let row_index: usize = block_pos.row.try_into().ok()?;
             let column_index: usize = block_pos.column.try_into().ok()?;
-            if field.0.get(row_index)?.get(column_index)?.is_some() {
+            if *field.0.get(row_index)?.get(column_index)? != LockedPiece::Empty {
                 return None;
             }
         }
@@ -216,7 +291,6 @@ impl<'a> ActivePiece<'a> {
             .iter()
             .zip(self.objects.iter_mut())
         {
-            let sprites = get_falling_piece_sprites();
             let screen_x =
                 (((block.column + self.data.pos.column) as i16 * 8) + (playfield_x as i16)) as u16;
             let screen_y =
@@ -224,13 +298,13 @@ impl<'a> ActivePiece<'a> {
 
             object.set_y(160_u16.wrapping_sub(screen_y + 8));
             object.set_x(screen_x);
-            object.set_sprite(sprites[self.data.which.index()].clone());
+            object.set_sprite(self.data.which.sprite().clone());
             object.show();
         }
     }
 }
 
-struct PlayField(pub SmallVec<[[Option<Piece>; 10]; 40]>);
+struct PlayField(pub SmallVec<[[LockedPiece; 10]; 40]>);
 
 const GRAVITY_TIMER: u16 = 60 * 3;
 const LOCK_DELAY_LEN: u16 = 60;
@@ -285,13 +359,9 @@ impl<'a> PlayMode<'a> {
                     x: (10 + j) as u16,
                     y: (19 - i) as u16,
                 };
-                let tile_id = if let Some(blk) = block {
-                    blk.index() as u16
-                } else {
-                    BLANK_TILE
-                };
 
-                let tile_setting = TileSetting::new(tile_id, false, false, 1);
+                let tile_setting =
+                    TileSetting::new(block.tile_index(), false, false, block.pal_index());
                 self.locked_piece_background.set_tile(
                     vram,
                     screen_pos,
@@ -331,24 +401,15 @@ impl<'a> TitleMode<'a> {
             TileFormat::FourBpp,
         );
 
-        let text_renderer_a = BIG_FONT.render_text(Vector2D {
-            x: 0,
-            y: 0,
-        });
+        let text_renderer_a = BIG_FONT.render_text(Vector2D { x: 0, y: 0 });
 
-        let text_renderer_b = MAIN_FONT.render_text(Vector2D {
-            x: 0,
-            y: 8,
-        });
+        let text_renderer_b = MAIN_FONT.render_text(Vector2D { x: 0, y: 8 });
 
-        let text_renderer_c = MAIN_FONT.render_text(Vector2D {
-            x: 0,
-            y: 12,
-        });
+        let text_renderer_c = MAIN_FONT.render_text(Vector2D { x: 0, y: 12 });
 
         Self {
             background,
-            text_renderers: [text_renderer_a, text_renderer_b, text_renderer_c]
+            text_renderers: [text_renderer_a, text_renderer_b, text_renderer_c],
         }
     }
 
@@ -374,7 +435,7 @@ impl<'a> TitleMode<'a> {
 
 struct PieceBag {
     rng: ChaCha8Rng,
-    bag: SmallVec<[Piece; 7]>,
+    bag: SmallVec<[ActivePieceType; 7]>,
 }
 
 impl PieceBag {
@@ -389,14 +450,12 @@ impl PieceBag {
         self.bag.truncate(0);
     }
 
-    fn next(&mut self) -> Piece {
+    fn next(&mut self) -> ActivePieceType {
         if let Some(piece) = self.bag.pop() {
             return piece;
         }
 
-        for i in 0..7 {
-            self.bag.push(Piece::from_index(i));
-        }
+        self.bag.extend_from_slice(&FULL_BAG);
 
         self.bag.shuffle(&mut self.rng);
         self.bag.pop().unwrap()
@@ -468,18 +527,10 @@ impl<'a> Game<'a> {
                     .data
                     .shift(&self.data.playfield, Pos { row: 1, column: 0 });
             } else if self.data.input.is_just_pressed(Button::L) {
-                play.active_piece.data.which = Piece::from_index(
-                    play.active_piece
-                        .data
-                        .which
-                        .index()
-                        .checked_sub(1)
-                        .unwrap_or(6),
-                );
+                play.active_piece.data.which = play.active_piece.data.which.debug_prev();
                 play.active_piece.data.rotation = 0;
             } else if self.data.input.is_just_pressed(Button::R) {
-                play.active_piece.data.which =
-                    Piece::from_index((play.active_piece.data.which.index() + 1) % 7);
+                play.active_piece.data.which = play.active_piece.data.which.debug_next();
                 play.active_piece.data.rotation = 0;
             } else if self.data.input.is_just_pressed(Button::DOWN) {
                 should_lock = !play
@@ -527,13 +578,16 @@ impl<'a> Game<'a> {
             for block in play.active_piece.data.current_rotation_data().hitbox {
                 let block_pos = play.active_piece.data.pos + block;
                 self.data.playfield.0[block_pos.row as usize][block_pos.column as usize] =
-                    Some(play.active_piece.data.which);
+                    play.active_piece.data.which.lock();
                 self.data.dirty_screen = true;
             }
 
-            self.data.playfield.0.retain(|row| row.iter().any(Option::is_none));
+            self.data
+                .playfield
+                .0
+                .retain(|row| row.iter().any(|x| *x == LockedPiece::Empty));
 
-            self.data.playfield.0.resize(40, [None; 10]);
+            self.data.playfield.0.resize(40, [LockedPiece::Empty; 10]);
 
             play.active_piece.reroll(&mut self.data.bag);
             play.gravity_timer = GRAVITY_TIMER;
@@ -548,10 +602,13 @@ impl<'a> Game<'a> {
         if self.data.input.is_just_pressed(Button::START) {
             self.mode = GameMode::Blank;
             self.data.bag.empty();
-            self.mode = GameMode::Playing(PlayMode::new(self.data.oam, self.data.background_man, &mut self.data.bag));
+            self.mode = GameMode::Playing(PlayMode::new(
+                self.data.oam,
+                self.data.background_man,
+                &mut self.data.bag,
+            ));
             self.data.dirty_screen = true;
         }
-
     }
 
     fn tick(&mut self, vram: &mut VRamManager) {
@@ -580,7 +637,7 @@ impl<'a> Game<'a> {
                 oam,
                 background_man,
                 input: ButtonController::new(),
-                playfield: PlayField(smallvec_inline![[None; 10]; 40]),
+                playfield: PlayField(smallvec_inline![[LockedPiece::Empty; 10]; 40]),
                 debug_active: false,
                 dirty_screen: true,
                 level: 0,
@@ -610,11 +667,27 @@ const fn gen_piece_palette() -> Palette16 {
     Palette16::new(compressed_colors)
 }
 
-static PIECE_PALETTE: Palette16 = gen_piece_palette();
+static MAIN_PIECE_PALETTE: Palette16 = gen_piece_palette();
 
-const fn gen_global_tile_palettes() -> [Palette16; 2] {
+const fn gen_aux_piece_palette() -> Palette16 {
+    let palette = [0x0, 0x0, 0x3226b, 0xc5c5c5, 0x939393];
+
+    let mut compressed_colors = [0; 16];
+
+    let mut i = 0;
+    while i < palette.len() {
+        compressed_colors[i] = html_color_to_gba(palette[i]);
+        i += 1;
+    }
+
+    Palette16::new(compressed_colors)
+}
+
+static AUX_PIECE_PALETTE: Palette16 = gen_aux_piece_palette();
+
+const fn gen_global_tile_palettes() -> [Palette16; 3] {
     const NULL_PALETTE: Palette16 = Palette16::new([0; 16]);
-    let mut ret = [NULL_PALETTE; 2];
+    let mut ret = [NULL_PALETTE; 3];
 
     let palette = [0x0, 0x0, 0xffffff, 0xffffff];
     let mut gba_palette = [0; 16];
@@ -627,6 +700,7 @@ const fn gen_global_tile_palettes() -> [Palette16; 2] {
 
     ret[0] = Palette16::new(gba_palette);
     ret[1] = gen_piece_palette();
+    ret[2] = gen_aux_piece_palette();
 
     ret
 }
@@ -663,9 +737,7 @@ fn get_global_tileset() -> &'static TileSet<'static> {
     static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
     static mut TILESTORE: SmallVec<[u16; 16 * 9]> = SmallVec::new_const();
     fn gen_global_tileset() -> TileSet<'static> {
-        let tiles = unsafe {
-            &mut TILESTORE
-        };
+        let tiles = unsafe { &mut TILESTORE };
         for i in 0..7 {
             tiles.extend_from_slice(&gen_piece_tile_data(i));
         }
@@ -679,9 +751,9 @@ fn get_global_tileset() -> &'static TileSet<'static> {
 
 //Don't call from irq lul
 fn get_falling_piece_sprites() -> &'static [SpriteVram] {
-    static mut FALLING_PIECE_SPRITES: InitOnce<SmallVec<[SpriteVram; 7]>> = InitOnce::new();
-    fn gen_falling_piece_sprites() -> SmallVec<[SpriteVram; 7]> {
-        let falling_piece_palette = PaletteVram::new(&PIECE_PALETTE).unwrap();
+    static mut FALLING_PIECE_SPRITES: InitOnce<SmallVec<[SpriteVram; 8]>> = InitOnce::new();
+    fn gen_falling_piece_sprites() -> SmallVec<[SpriteVram; 8]> {
+        let falling_piece_palette = PaletteVram::new(&MAIN_PIECE_PALETTE).unwrap();
         let mut falling_piece_sprites = SmallVec::new();
         for i in 0..7 {
             let tile_data = gen_piece_tile_data(i);
@@ -690,6 +762,15 @@ fn get_falling_piece_sprites() -> &'static [SpriteVram] {
                     .to_vram(falling_piece_palette.clone());
             falling_piece_sprites.push(sprite);
         }
+        let falling_piece_palette2 = PaletteVram::new(&AUX_PIECE_PALETTE).unwrap();
+        let ghost_tile_data = gen_piece_tile_data(0);
+        let ghost_tile = DynamicSprite::new(
+            u16_slice_as_u8(&ghost_tile_data),
+            display::object::Size::S8x8,
+        )
+        .to_vram(falling_piece_palette2);
+        falling_piece_sprites.push(ghost_tile);
+
         falling_piece_sprites
     }
 
