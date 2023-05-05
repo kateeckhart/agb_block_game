@@ -7,11 +7,10 @@
 #![feature(const_mut_refs)]
 #![feature(const_cmp)]
 
-extern crate alloc;
-
 mod piece_data;
 mod util;
 
+use agb::display::font::{Font, TextRenderer};
 use agb::display::object::{DynamicSprite, OamManaged, Object, PaletteVram, SpriteVram};
 use agb::display::palette16::Palette16;
 use agb::display::tiled::{
@@ -21,8 +20,10 @@ use agb::fixnum::Vector2D;
 use agb::input::{Button, ButtonController};
 use agb::sync::InitOnce;
 use agb::{display, interrupt};
+use agb::include_font;
 use core::cmp::min;
 use core::convert::TryInto;
+use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops;
 use rand::prelude::*;
@@ -30,6 +31,9 @@ use rand_chacha::ChaCha8Rng;
 use piece_data::{PieceData, PIECE_DATA};
 use smallvec::{SmallVec, smallvec_inline};
 use util::{html_color_to_gba, u16_slice_as_u8};
+
+static BIG_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 24);
+static MAIN_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 12);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Pos {
@@ -194,25 +198,14 @@ impl<'a> ActivePiece<'a> {
         for _ in 0..4 {
             falling_piece_objects.push(oam.object(falling_piece_sprites[0].clone()));
         }
-        let mut ret = ActivePiece {
+        ActivePiece {
             data: ActivePieceData::new(bag),
             objects: falling_piece_objects,
-        };
-
-        ret.update_color();
-        ret
-    }
-
-    fn update_color(&mut self) {
-        let falling_piece_sprites = get_falling_piece_sprites();
-        for obj in &mut self.objects {
-            obj.set_sprite(falling_piece_sprites[self.data.which.index()].clone());
         }
     }
 
     fn reroll(&mut self, bag: &mut PieceBag) {
         self.data = ActivePieceData::new(bag);
-        self.update_color();
     }
 
     fn draw(&mut self, playfield_x: u16, playfield_y: u16) {
@@ -271,7 +264,7 @@ impl<'a> PlayMode<'a> {
             let left_pos = Vector2D { x: 9, y };
             let right_pos = Vector2D { x: 20, y };
 
-            let tile_setting = TileSetting::new(SOLID_TILE, false, false, 1);
+            let tile_setting = TileSetting::new(SOLID_TILE, false, false, 0);
 
             self.locked_piece_background.set_tile(
                 vram,
@@ -298,7 +291,7 @@ impl<'a> PlayMode<'a> {
                     BLANK_TILE
                 };
 
-                let tile_setting = TileSetting::new(tile_id, false, false, 0);
+                let tile_setting = TileSetting::new(tile_id, false, false, 1);
                 self.locked_piece_background.set_tile(
                     vram,
                     screen_pos,
@@ -310,7 +303,7 @@ impl<'a> PlayMode<'a> {
         self.locked_piece_background.show();
     }
 
-    fn sprite_draw(&mut self, vram: &mut VRamManager) {
+    fn sprite_draw(&mut self, _: &mut VRamManager) {
         self.active_piece.draw(80, 0);
     }
 
@@ -322,6 +315,61 @@ impl<'a> PlayMode<'a> {
 enum GameMode<'a> {
     Blank,
     Playing(PlayMode<'a>),
+    Title(TitleMode<'a>),
+}
+
+struct TitleMode<'a> {
+    background: MapLoan<'a, RegularMap>,
+    text_renderers: [TextRenderer<'static>; 3],
+}
+
+impl<'a> TitleMode<'a> {
+    fn new(background_man: &'a Tiled0) -> Self {
+        let background = background_man.background(
+            display::Priority::P1,
+            display::tiled::RegularBackgroundSize::Background32x32,
+            TileFormat::FourBpp,
+        );
+
+        let text_renderer_a = BIG_FONT.render_text(Vector2D {
+            x: 0,
+            y: 0,
+        });
+
+        let text_renderer_b = MAIN_FONT.render_text(Vector2D {
+            x: 0,
+            y: 8,
+        });
+
+        let text_renderer_c = MAIN_FONT.render_text(Vector2D {
+            x: 0,
+            y: 12,
+        });
+
+        Self {
+            background,
+            text_renderers: [text_renderer_a, text_renderer_b, text_renderer_c]
+        }
+    }
+
+    fn redraw(&mut self, _: &CommonGameData, vram: &mut VRamManager) {
+        static LINES: &[&str] = &["AGB Block Game", "By Kate \u{1} Eckhart", "Press Start"];
+        for (line, renderer) in LINES.iter().zip(&mut self.text_renderers) {
+            let mut writer = renderer.writer(2, 1, &mut self.background, vram);
+            write!(writer, "{}", line).expect("Title render error");
+        }
+
+        self.background.show();
+    }
+
+    fn sprite_draw(&mut self, _: &mut VRamManager) {}
+
+    fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
+        for line in &mut self.text_renderers {
+            line.commit(&mut self.background, vram);
+        }
+        self.background.commit(vram);
+    }
 }
 
 struct PieceBag {
@@ -335,6 +383,10 @@ impl PieceBag {
             rng: ChaCha8Rng::from_seed(*include_bytes!("seed.bin")),
             bag: SmallVec::new(),
         }
+    }
+
+    fn empty(&mut self) {
+        self.bag.truncate(0);
     }
 
     fn next(&mut self) -> Piece {
@@ -351,17 +403,19 @@ impl PieceBag {
     }
 }
 
-struct CommonGameData {
+struct CommonGameData<'a> {
     playfield: PlayField,
     debug_active: bool,
     dirty_screen: bool,
     level: u8,
     input: ButtonController,
     bag: PieceBag,
+    oam: &'a OamManaged<'a>,
+    background_man: &'a Tiled0<'a>,
 }
 
 struct Game<'a> {
-    data: CommonGameData,
+    data: CommonGameData<'a>,
     mode: GameMode<'a>,
 }
 
@@ -369,6 +423,7 @@ impl<'a> Game<'a> {
     fn redraw(&mut self, vram: &mut VRamManager) {
         match self.mode {
             GameMode::Playing(ref mut play) => play.redraw(&self.data, vram),
+            GameMode::Title(ref mut title) => title.redraw(&self.data, vram),
             _ => (),
         }
     }
@@ -376,11 +431,12 @@ impl<'a> Game<'a> {
     fn sprite_draw(&mut self, vram: &mut VRamManager) {
         match self.mode {
             GameMode::Playing(ref mut play) => play.sprite_draw(vram),
+            GameMode::Title(ref mut title) => title.sprite_draw(vram),
             _ => (),
         }
     }
 
-    fn play_tick(&mut self, vram: &mut VRamManager) {
+    fn play_tick(&mut self, _: &mut VRamManager) {
         let mut should_lock = false;
         let mut play = match self.mode {
             GameMode::Playing(ref mut play) => play,
@@ -488,15 +544,27 @@ impl<'a> Game<'a> {
         }
     }
 
+    fn title_tick(&mut self, _: &mut VRamManager) {
+        if self.data.input.is_just_pressed(Button::START) {
+            self.mode = GameMode::Blank;
+            self.data.bag.empty();
+            self.mode = GameMode::Playing(PlayMode::new(self.data.oam, self.data.background_man, &mut self.data.bag));
+            self.data.dirty_screen = true;
+        }
+
+    }
+
     fn tick(&mut self, vram: &mut VRamManager) {
         match self.mode {
             GameMode::Playing(_) => self.play_tick(vram),
+            GameMode::Title(_) => self.title_tick(vram),
             _ => (),
         }
     }
 
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
         match self.mode {
+            GameMode::Title(ref mut title) => title.commit_backgrounds(vram),
             GameMode::Playing(ref mut play) => play.commit_backgrounds(vram),
             _ => (),
         }
@@ -504,11 +572,13 @@ impl<'a> Game<'a> {
 }
 
 impl<'a> Game<'a> {
-    fn new(oam: &'a OamManaged, background: &'a Tiled0) -> Self {
-        let mut bag = PieceBag::new();
-        let mode = GameMode::Playing(PlayMode::new(oam, background, &mut bag));
+    fn new(oam: &'a OamManaged<'a>, background_man: &'a Tiled0<'a>) -> Self {
+        let bag = PieceBag::new();
+        let mode = GameMode::Title(TitleMode::new(background_man));
         Self {
             data: CommonGameData {
+                oam,
+                background_man,
                 input: ButtonController::new(),
                 playfield: PlayField(smallvec_inline![[None; 10]; 40]),
                 debug_active: false,
@@ -545,9 +615,8 @@ static PIECE_PALETTE: Palette16 = gen_piece_palette();
 const fn gen_global_tile_palettes() -> [Palette16; 2] {
     const NULL_PALETTE: Palette16 = Palette16::new([0; 16]);
     let mut ret = [NULL_PALETTE; 2];
-    ret[0] = gen_piece_palette();
 
-    let palette = [0x0, 0x0, 0xffffff];
+    let palette = [0x0, 0x0, 0xffffff, 0xffffff];
     let mut gba_palette = [0; 16];
 
     let mut i = 0;
@@ -555,7 +624,9 @@ const fn gen_global_tile_palettes() -> [Palette16; 2] {
         gba_palette[i] = html_color_to_gba(palette[i]);
         i += 1;
     }
-    ret[1] = Palette16::new(gba_palette);
+
+    ret[0] = Palette16::new(gba_palette);
+    ret[1] = gen_piece_palette();
 
     ret
 }
@@ -592,13 +663,13 @@ fn get_global_tileset() -> &'static TileSet<'static> {
     static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
     static mut TILESTORE: SmallVec<[u16; 16 * 9]> = SmallVec::new_const();
     fn gen_global_tileset() -> TileSet<'static> {
-        let mut tiles = unsafe {
+        let tiles = unsafe {
             &mut TILESTORE
         };
         for i in 0..7 {
             tiles.extend_from_slice(&gen_piece_tile_data(i));
         }
-        tiles.resize(tiles.len() + 16, 0x2222);
+        tiles.resize(tiles.len() + 16, 0x3333);
         tiles.resize(tiles.len() + 16, 0x0);
         TileSet::new(u16_slice_as_u8(tiles), TileFormat::FourBpp)
     }
