@@ -5,7 +5,6 @@
 #![cfg_attr(test, reexport_test_harness_main = "test_main")]
 #![cfg_attr(test, test_runner(agb::test_runner::test_runner))]
 #![feature(const_mut_refs)]
-#![feature(const_cmp)]
 
 mod piece_data;
 mod util;
@@ -306,6 +305,48 @@ impl<'a> ActivePiece<'a> {
 
 struct PlayField(pub SmallVec<[[LockedPiece; 10]; 40]>);
 
+impl PlayField {
+    fn draw(&self, background: &mut RegularMap, vram: &mut VRamManager) {
+        for y in 0..20 {
+            let left_pos = Vector2D { x: 9, y };
+            let right_pos = Vector2D { x: 20, y };
+
+            let tile_setting = TileSetting::new(SOLID_TILE, false, false, 0);
+
+            background.set_tile(
+                vram,
+                left_pos,
+                get_global_tileset(),
+                tile_setting,
+            );
+            background.set_tile(
+                vram,
+                right_pos,
+                get_global_tileset(),
+                tile_setting,
+            );
+        }
+        for (i, row) in self.0[..20].iter().enumerate() {
+            for (j, block) in row.iter().enumerate() {
+                let screen_pos = Vector2D {
+                    x: (10 + j) as u16,
+                    y: (19 - i) as u16,
+                };
+
+                let tile_setting =
+                    TileSetting::new(block.tile_index(), false, false, block.pal_index());
+                background.set_tile(
+                    vram,
+                    screen_pos,
+                    get_global_tileset(),
+                    tile_setting,
+                )
+            }
+        }
+        background.show();
+    }
+}
+
 const GRAVITY_TIMER: u16 = 60 * 3;
 const LOCK_DELAY_LEN: u16 = 60;
 const LOCK_RESET_COUNT: u8 = 20;
@@ -334,43 +375,7 @@ impl<'a> PlayMode<'a> {
     }
 
     fn redraw(&mut self, data: &CommonGameData, vram: &mut VRamManager) {
-        for y in 0..20 {
-            let left_pos = Vector2D { x: 9, y };
-            let right_pos = Vector2D { x: 20, y };
-
-            let tile_setting = TileSetting::new(SOLID_TILE, false, false, 0);
-
-            self.locked_piece_background.set_tile(
-                vram,
-                left_pos,
-                get_global_tileset(),
-                tile_setting,
-            );
-            self.locked_piece_background.set_tile(
-                vram,
-                right_pos,
-                get_global_tileset(),
-                tile_setting,
-            );
-        }
-        for (i, row) in data.playfield.0[..20].iter().enumerate() {
-            for (j, block) in row.iter().enumerate() {
-                let screen_pos = Vector2D {
-                    x: (10 + j) as u16,
-                    y: (19 - i) as u16,
-                };
-
-                let tile_setting =
-                    TileSetting::new(block.tile_index(), false, false, block.pal_index());
-                self.locked_piece_background.set_tile(
-                    vram,
-                    screen_pos,
-                    get_global_tileset(),
-                    tile_setting,
-                )
-            }
-        }
-        self.locked_piece_background.show();
+        data.playfield.draw(&mut self.locked_piece_background, vram);
     }
 
     fn sprite_draw(&mut self, _: &mut VRamManager) {
@@ -380,12 +385,10 @@ impl<'a> PlayMode<'a> {
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
         self.locked_piece_background.commit(vram);
     }
-}
 
-enum GameMode<'a> {
-    Blank,
-    Playing(PlayMode<'a>),
-    Title(TitleMode<'a>),
+    fn release_vram(&mut self, vram: &mut VRamManager) {
+        self.locked_piece_background.clear(vram)
+    }
 }
 
 struct TitleMode<'a> {
@@ -416,6 +419,7 @@ impl<'a> TitleMode<'a> {
     fn redraw(&mut self, _: &CommonGameData, vram: &mut VRamManager) {
         static LINES: &[&str] = &["AGB Block Game", "By Kate \u{1} Eckhart", "Press Start"];
         for (line, renderer) in LINES.iter().zip(&mut self.text_renderers) {
+            renderer.clear(vram);
             let mut writer = renderer.writer(2, 1, &mut self.background, vram);
             write!(writer, "{}", line).expect("Title render error");
         }
@@ -431,6 +435,68 @@ impl<'a> TitleMode<'a> {
         }
         self.background.commit(vram);
     }
+
+    fn release_vram(&mut self, vram: &mut VRamManager) {
+        for line in &mut self.text_renderers {
+            line.clear(vram);
+        }
+        self.background.clear(vram);
+    }
+}
+
+struct GameOverMode<'a> {
+    background: MapLoan<'a, RegularMap>,
+    column_index: usize,
+    row_index: usize,
+    text_renderer: TextRenderer<'static>,
+}
+
+impl<'a> GameOverMode<'a> {
+    fn new(background_man: &'a Tiled0) -> Self {
+        let background = background_man.background(
+            display::Priority::P1,
+            display::tiled::RegularBackgroundSize::Background32x32,
+            TileFormat::FourBpp,
+        );
+
+        Self {
+            background,
+            text_renderer: MAIN_FONT.render_text(Vector2D { x: 0, y: 6 }),
+            column_index: 0,
+            row_index: 0,
+        }
+    }
+
+    fn redraw(&mut self, data: &CommonGameData, vram: &mut VRamManager) {
+        self.text_renderer.clear(vram);
+        if self.row_index == 20 {
+            let mut writer = self.text_renderer.writer(2, 1, &mut self.background, vram);
+            write!(writer, "Game Over").expect("Game Over Text render error");
+        }
+        
+        data.playfield.draw(&mut self.background, vram);
+
+        self.background.show();
+    }
+
+    fn sprite_draw(&mut self, _: &mut VRamManager) {}
+
+    fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
+        self.text_renderer.commit(&mut self.background, vram);
+        self.background.commit(vram);
+    }
+
+    fn release_vram(&mut self, vram: &mut VRamManager) {
+        self.text_renderer.clear(vram);
+        self.background.clear(vram);
+    }
+}
+
+enum GameMode<'a> {
+    Blank,
+    Playing(PlayMode<'a>),
+    Title(TitleMode<'a>),
+    GameOver(GameOverMode<'a>),
 }
 
 struct PieceBag {
@@ -483,6 +549,7 @@ impl<'a> Game<'a> {
         match self.mode {
             GameMode::Playing(ref mut play) => play.redraw(&self.data, vram),
             GameMode::Title(ref mut title) => title.redraw(&self.data, vram),
+            GameMode::GameOver(ref mut over) => over.redraw(&self.data, vram),
             _ => (),
         }
     }
@@ -491,13 +558,14 @@ impl<'a> Game<'a> {
         match self.mode {
             GameMode::Playing(ref mut play) => play.sprite_draw(vram),
             GameMode::Title(ref mut title) => title.sprite_draw(vram),
+            GameMode::GameOver(ref mut over) => over.sprite_draw(vram),
             _ => (),
         }
     }
 
-    fn play_tick(&mut self, _: &mut VRamManager) {
+    fn play_tick(&mut self, vram: &mut VRamManager) {
         let mut should_lock = false;
-        let mut play = match self.mode {
+        let play = match self.mode {
             GameMode::Playing(ref mut play) => play,
             _ => panic!(),
         };
@@ -590,18 +658,33 @@ impl<'a> Game<'a> {
             self.data.playfield.0.resize(40, [LockedPiece::Empty; 10]);
 
             play.active_piece.reroll(&mut self.data.bag);
-            play.gravity_timer = GRAVITY_TIMER;
-            play.lock_delay = LOCK_DELAY_LEN;
-            play.lock_reset_count = LOCK_RESET_COUNT;
+
+            if play.active_piece.data.blocked(&self.data.playfield) {
+                play.release_vram(vram);
+                self.mode = GameMode::Blank;
+                self.mode = GameMode::GameOver(GameOverMode::new(self.data.background_man));
+            } else {
+                play.gravity_timer = GRAVITY_TIMER;
+                play.lock_delay = LOCK_DELAY_LEN;
+                play.lock_reset_count = LOCK_RESET_COUNT;
+            }
         } else if should_lock {
             play.lock_delay -= 1;
         }
     }
 
-    fn title_tick(&mut self, _: &mut VRamManager) {
+    fn title_tick(&mut self, vram: &mut VRamManager) {
+        let title = match self.mode {
+            GameMode::Title(ref mut title) => title,
+            _ => panic!(),
+        };
+
         if self.data.input.is_just_pressed(Button::START) {
+            title.release_vram(vram);
             self.mode = GameMode::Blank;
             self.data.bag.empty();
+            self.data.playfield.0.truncate(0);
+            self.data.playfield.0.resize(40, [LockedPiece::Empty; 10]);
             self.mode = GameMode::Playing(PlayMode::new(
                 self.data.oam,
                 self.data.background_man,
@@ -611,10 +694,44 @@ impl<'a> Game<'a> {
         }
     }
 
+    fn game_over_tick(&mut self, vram: &mut VRamManager) {
+        let over = match self.mode {
+            GameMode::GameOver(ref mut over) => over,
+            _ => panic!(),
+        };
+
+        if over.row_index == 20 && self.data.input.is_just_pressed(Button::START) {
+            over.release_vram(vram);
+            self.mode = GameMode::Blank;
+            self.mode = GameMode::Title(TitleMode::new(self.data.background_man));
+            self.data.dirty_screen = true;
+            return;
+        }
+
+        for _ in 0..8 {
+            if over.row_index == 20 {
+                break;
+            }
+            let block = &mut self.data.playfield.0[over.row_index][over.column_index];
+            if *block != LockedPiece::Empty {
+                *block = LockedPiece::Garbage;
+            }
+
+            over.column_index += 1;
+            if over.column_index == 10 {
+                over.column_index = 0;
+                over.row_index += 1;
+            }
+
+            self.data.dirty_screen = true;
+        }
+    }
+
     fn tick(&mut self, vram: &mut VRamManager) {
         match self.mode {
             GameMode::Playing(_) => self.play_tick(vram),
             GameMode::Title(_) => self.title_tick(vram),
+            GameMode::GameOver(_) => self.game_over_tick(vram),
             _ => (),
         }
     }
@@ -623,6 +740,7 @@ impl<'a> Game<'a> {
         match self.mode {
             GameMode::Title(ref mut title) => title.commit_backgrounds(vram),
             GameMode::Playing(ref mut play) => play.commit_backgrounds(vram),
+            GameMode::GameOver(ref mut over) => over.commit_backgrounds(vram),
             _ => (),
         }
     }
@@ -630,8 +748,6 @@ impl<'a> Game<'a> {
 
 impl<'a> Game<'a> {
     fn new(oam: &'a OamManaged<'a>, background_man: &'a Tiled0<'a>) -> Self {
-        let bag = PieceBag::new();
-        let mode = GameMode::Title(TitleMode::new(background_man));
         Self {
             data: CommonGameData {
                 oam,
@@ -641,9 +757,9 @@ impl<'a> Game<'a> {
                 debug_active: false,
                 dirty_screen: true,
                 level: 0,
-                bag,
+                bag: PieceBag::new(),
             },
-            mode,
+            mode: GameMode::Title(TitleMode::new(background_man)),
         }
     }
 }
@@ -792,7 +908,7 @@ fn main(mut gba: agb::Gba) -> ! {
         unsafe { core::mem::transmute(game) }
     }
 
-    let mut game = unsafe { assign_game_lifetimes(&mut GAME) }.write(Game::new(&objects, &tiled));
+    let game = unsafe { assign_game_lifetimes(&mut GAME) }.write(Game::new(&objects, &tiled));
 
     let mut debug_indicator = objects.object(get_falling_piece_sprites()[0].clone());
     debug_indicator.set_x(0);
