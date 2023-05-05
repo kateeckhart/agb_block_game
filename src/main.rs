@@ -32,7 +32,7 @@ use smallvec::{smallvec_inline, SmallVec};
 use util::{html_color_to_gba, u16_slice_as_u8};
 
 static BIG_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 24);
-static MAIN_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 12);
+static MAIN_FONT: Font = include_font!("data/third_party/noto/NotoSerif-Regular.ttf", 14);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Pos {
@@ -134,6 +134,10 @@ impl ActivePieceType {
         match self {
             ActivePieceType::Base(piece) | ActivePieceType::Ghost(piece) => piece,
         }
+    }
+
+    fn ghost(self) -> Self {
+        ActivePieceType::Ghost(self.base())
     }
 
     fn lock(self) -> LockedPiece {
@@ -266,11 +270,13 @@ struct ActivePiece<'a> {
 }
 
 impl<'a> ActivePiece<'a> {
-    fn new(oam: &'a OamManaged, bag: &mut PieceBag) -> ActivePiece<'a> {
+    fn new(oam: &'a OamManaged, priority: i32, bag: &mut PieceBag) -> ActivePiece<'a> {
         let mut falling_piece_objects = SmallVec::new();
         let falling_piece_sprites = get_falling_piece_sprites();
         for _ in 0..4 {
-            falling_piece_objects.push(oam.object(falling_piece_sprites[0].clone()));
+            let mut object = oam.object(falling_piece_sprites[0].clone());
+            object.set_z(priority);
+            falling_piece_objects.push(object);
         }
         ActivePiece {
             data: ActivePieceData::new(bag),
@@ -353,6 +359,7 @@ const LOCK_RESET_COUNT: u8 = 20;
 
 struct PlayMode<'a> {
     active_piece: ActivePiece<'a>,
+    ghost_piece: ActivePiece<'a>,
     locked_piece_background: MapLoan<'a, RegularMap>,
     gravity_timer: u16,
     lock_delay: u16,
@@ -362,7 +369,8 @@ struct PlayMode<'a> {
 impl<'a> PlayMode<'a> {
     fn new(oam: &'a OamManaged, background: &'a Tiled0, bag: &mut PieceBag) -> Self {
         Self {
-            active_piece: ActivePiece::new(oam, bag),
+            active_piece: ActivePiece::new(oam, 0, bag),
+            ghost_piece: ActivePiece::new(oam, 1, bag),
             locked_piece_background: background.background(
                 display::Priority::P1,
                 display::tiled::RegularBackgroundSize::Background32x32,
@@ -380,6 +388,7 @@ impl<'a> PlayMode<'a> {
 
     fn sprite_draw(&mut self, _: &mut VRamManager) {
         self.active_piece.draw(80, 0);
+        self.ghost_piece.draw(80, 0);
     }
 
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
@@ -461,7 +470,7 @@ impl<'a> GameOverMode<'a> {
 
         Self {
             background,
-            text_renderer: MAIN_FONT.render_text(Vector2D { x: 0, y: 6 }),
+            text_renderer: MAIN_FONT.render_text(Vector2D { x: 10, y: 8 }),
             column_index: 0,
             row_index: 0,
         }
@@ -663,6 +672,7 @@ impl<'a> Game<'a> {
                 play.release_vram(vram);
                 self.mode = GameMode::Blank;
                 self.mode = GameMode::GameOver(GameOverMode::new(self.data.background_man));
+                return
             } else {
                 play.gravity_timer = GRAVITY_TIMER;
                 play.lock_delay = LOCK_DELAY_LEN;
@@ -671,6 +681,10 @@ impl<'a> Game<'a> {
         } else if should_lock {
             play.lock_delay -= 1;
         }
+
+        play.ghost_piece.data = play.active_piece.data;
+        play.ghost_piece.data.which = play.ghost_piece.data.which.ghost();
+        while play.ghost_piece.data.shift(&self.data.playfield, Pos {row: -1, column: 0}) {}
     }
 
     fn title_tick(&mut self, vram: &mut VRamManager) {
