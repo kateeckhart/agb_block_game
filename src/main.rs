@@ -6,6 +6,17 @@
 #![cfg_attr(test, test_runner(agb::test_runner::test_runner))]
 #![feature(const_mut_refs)]
 
+macro_rules! include_u16_array {
+    ($filename: expr) => {
+        {
+            const BYTES: &[u8] = include_bytes!($filename);
+            type WordsType = [u16; BYTES.len() / 2];
+            const WORDS: WordsType = unsafe { ::core::mem::transmute(*include_bytes!($filename)) };
+            &WORDS
+        }
+    }
+}
+
 mod piece_data;
 mod util;
 
@@ -189,8 +200,7 @@ struct ActivePieceData {
 }
 
 impl ActivePieceData {
-    fn new(bag: &mut PieceBag) -> ActivePieceData {
-        let which = bag.next();
+    fn new(which: ActivePieceType) -> ActivePieceData {
         let row = if which == ActivePieceType::Base(BasePiece::I) {
             17
         } else {
@@ -270,7 +280,7 @@ struct ActivePiece<'a> {
 }
 
 impl<'a> ActivePiece<'a> {
-    fn new(oam: &'a OamManaged, priority: i32, bag: &mut PieceBag) -> ActivePiece<'a> {
+    fn new(oam: &'a OamManaged, priority: i32, which: ActivePieceType) -> ActivePiece<'a> {
         let mut falling_piece_objects = SmallVec::new();
         let falling_piece_sprites = get_falling_piece_sprites();
         for _ in 0..4 {
@@ -279,13 +289,15 @@ impl<'a> ActivePiece<'a> {
             falling_piece_objects.push(object);
         }
         ActivePiece {
-            data: ActivePieceData::new(bag),
+            data: ActivePieceData::new(which),
             objects: falling_piece_objects,
         }
     }
 
-    fn reroll(&mut self, bag: &mut PieceBag) {
-        self.data = ActivePieceData::new(bag);
+    fn hide(&mut self) {
+        for obj in &mut self.objects {
+            obj.hide();
+        }
     }
 
     fn draw(&mut self, playfield_x: u16, playfield_y: u16) {
@@ -368,9 +380,10 @@ struct PlayMode<'a> {
 
 impl<'a> PlayMode<'a> {
     fn new(oam: &'a OamManaged, background: &'a Tiled0, bag: &mut PieceBag) -> Self {
+        let first_piece = bag.next();
         Self {
-            active_piece: ActivePiece::new(oam, 0, bag),
-            ghost_piece: ActivePiece::new(oam, 1, bag),
+            active_piece: ActivePiece::new(oam, 0, first_piece),
+            ghost_piece: ActivePiece::new(oam, 1, first_piece),
             locked_piece_background: background.background(
                 display::Priority::P1,
                 display::tiled::RegularBackgroundSize::Background32x32,
@@ -383,12 +396,13 @@ impl<'a> PlayMode<'a> {
     }
 
     fn redraw(&mut self, data: &CommonGameData, vram: &mut VRamManager) {
-        data.playfield.draw(&mut self.locked_piece_background, vram);
+        data.redraw(&mut self.locked_piece_background, vram);
     }
 
-    fn sprite_draw(&mut self, _: &mut VRamManager) {
+    fn sprite_draw(&mut self, data: &mut CommonGameData, _: &mut VRamManager) {
         self.active_piece.draw(80, 0);
         self.ghost_piece.draw(80, 0);
+        data.sprite_draw();
     }
 
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
@@ -436,7 +450,7 @@ impl<'a> TitleMode<'a> {
         self.background.show();
     }
 
-    fn sprite_draw(&mut self, _: &mut VRamManager) {}
+    fn sprite_draw(&mut self, _: &mut CommonGameData, _: &mut VRamManager) {}
 
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
         for line in &mut self.text_renderers {
@@ -483,12 +497,14 @@ impl<'a> GameOverMode<'a> {
             write!(writer, "Game Over").expect("Game Over Text render error");
         }
         
-        data.playfield.draw(&mut self.background, vram);
+        data.redraw(&mut self.background, vram);
 
         self.background.show();
     }
 
-    fn sprite_draw(&mut self, _: &mut VRamManager) {}
+    fn sprite_draw(&mut self, data: &mut CommonGameData, _: &mut VRamManager) {
+        data.sprite_draw();
+    }
 
     fn commit_backgrounds(&mut self, vram: &mut VRamManager) {
         self.text_renderer.commit(&mut self.background, vram);
@@ -515,25 +531,120 @@ struct PieceBag {
 
 impl PieceBag {
     fn new() -> Self {
-        Self {
+        let mut ret = Self {
             rng: ChaCha8Rng::from_seed(*include_bytes!("seed.bin")),
             bag: SmallVec::new(),
-        }
+        };
+        ret.refill_bag();
+        ret
     }
 
-    fn empty(&mut self) {
+    fn refill_bag(&mut self) {
+        self.bag.extend_from_slice(&FULL_BAG);
+        self.bag.shuffle(&mut self.rng);
+    }
+
+    fn reset(&mut self) {
         self.bag.truncate(0);
+        self.refill_bag();
+    }
+
+    fn peek(&self) -> ActivePieceType {
+        *self.bag.last().unwrap()
     }
 
     fn next(&mut self) -> ActivePieceType {
-        if let Some(piece) = self.bag.pop() {
-            return piece;
+        let piece = self.bag.pop().unwrap();
+        if self.bag.is_empty() {
+            self.refill_bag()
+        }
+        piece
+    }
+}
+
+struct NextBox<'a> {
+    text: TextRenderer<'static>,
+    next_piece: ActivePiece<'a>,
+}
+
+impl<'a> NextBox<'a> {
+    fn new(oam: &'a OamManaged) -> Self {
+        Self {
+            text: MAIN_FONT.render_text(Vector2D {
+                x: 24,
+                y: 2,
+            }),
+            next_piece: ActivePiece::new(oam, 0, ActivePieceType::Base(BasePiece::I)),
+        }
+    }
+
+    fn hide(&mut self) {
+        self.next_piece.hide();
+    }
+
+    fn draw_sprites(&mut self, which: ActivePieceType) {
+        self.next_piece.data = ActivePieceData::new(which);
+        self.next_piece.data.pos.row = 0;
+        let mut piece_x = 172;
+        if [BasePiece::I, BasePiece::O].contains(&self.next_piece.data.which.base()) {
+            piece_x -= 4;
+        }
+        let mut piece_y = 96;
+        if self.next_piece.data.which.base() == BasePiece::I {
+            piece_y -= 4;
+        }
+        self.next_piece.draw(piece_x, piece_y);
+    }
+
+    fn draw_background(&self, background: &mut RegularMap, vram: &mut VRamManager) {
+        for x in 24..28 {
+            background.set_tile(vram, Vector2D {
+                x,
+                y: 4
+            }, get_global_tileset(), TileSetting::new(HORZ_BORDER_TILE, false, true, 0))
         }
 
-        self.bag.extend_from_slice(&FULL_BAG);
+        for x in 24..28 {
+            background.set_tile(vram, Vector2D {
+                x,
+                y: 7
+            }, get_global_tileset(), TileSetting::new(HORZ_BORDER_TILE, false, false, 0))
+        }
 
-        self.bag.shuffle(&mut self.rng);
-        self.bag.pop().unwrap()
+        for y in 4..7 {
+            background.set_tile(vram, Vector2D {
+                x: 23,
+                y,
+            }, get_global_tileset(), TileSetting::new(VERT_BORDER_TILE, false, false, 0))
+        }
+
+        for y in 4..7 {
+            background.set_tile(vram, Vector2D {
+                x: 28,
+                y,
+            }, get_global_tileset(), TileSetting::new(VERT_BORDER_TILE, true, false, 0))
+        }
+
+        background.set_tile(vram, Vector2D {
+            x: 23,
+            y: 4,
+        }, get_global_tileset(), TileSetting::new(CORNER_TILE, false, true, 0));
+
+        background.set_tile(vram, Vector2D {
+            x: 28,
+            y: 4,
+        }, get_global_tileset(), TileSetting::new(CORNER_TILE, true, true, 0));
+
+
+        background.set_tile(vram, Vector2D {
+            x: 23,
+            y: 7,
+        }, get_global_tileset(), TileSetting::new(CORNER_TILE, false, false, 0));
+
+        background.set_tile(vram, Vector2D {
+            x: 28,
+            y: 7,
+        }, get_global_tileset(), TileSetting::new(CORNER_TILE, true, false, 0));
     }
 }
 
@@ -546,6 +657,18 @@ struct CommonGameData<'a> {
     bag: PieceBag,
     oam: &'a OamManaged<'a>,
     background_man: &'a Tiled0<'a>,
+    next_box: NextBox<'a>,
+}
+
+impl CommonGameData<'_> {
+    fn redraw(&self, background: &mut RegularMap, vram: &mut VRamManager) {
+        self.playfield.draw(background, vram);
+        self.next_box.draw_background(background, vram);
+    }
+
+    fn sprite_draw(&mut self) {
+        self.next_box.draw_sprites(self.bag.peek())
+    }
 }
 
 struct Game<'a> {
@@ -565,9 +688,9 @@ impl<'a> Game<'a> {
 
     fn sprite_draw(&mut self, vram: &mut VRamManager) {
         match self.mode {
-            GameMode::Playing(ref mut play) => play.sprite_draw(vram),
-            GameMode::Title(ref mut title) => title.sprite_draw(vram),
-            GameMode::GameOver(ref mut over) => over.sprite_draw(vram),
+            GameMode::Playing(ref mut play) => play.sprite_draw(&mut self.data, vram),
+            GameMode::Title(ref mut title) => title.sprite_draw(&mut self.data, vram),
+            GameMode::GameOver(ref mut over) => over.sprite_draw(&mut self.data, vram),
             _ => (),
         }
     }
@@ -666,14 +789,16 @@ impl<'a> Game<'a> {
 
             self.data.playfield.0.resize(40, [LockedPiece::Empty; 10]);
 
-            play.active_piece.reroll(&mut self.data.bag);
+            let new_piece = ActivePieceData::new(self.data.bag.peek());
 
-            if play.active_piece.data.blocked(&self.data.playfield) {
+            if new_piece.blocked(&self.data.playfield) {
                 play.release_vram(vram);
                 self.mode = GameMode::Blank;
                 self.mode = GameMode::GameOver(GameOverMode::new(self.data.background_man));
                 return
             } else {
+                self.data.bag.next();
+                play.active_piece.data = new_piece;
                 play.gravity_timer = GRAVITY_TIMER;
                 play.lock_delay = LOCK_DELAY_LEN;
                 play.lock_reset_count = LOCK_RESET_COUNT;
@@ -696,7 +821,7 @@ impl<'a> Game<'a> {
         if self.data.input.is_just_pressed(Button::START) {
             title.release_vram(vram);
             self.mode = GameMode::Blank;
-            self.data.bag.empty();
+            self.data.bag.reset();
             self.data.playfield.0.truncate(0);
             self.data.playfield.0.resize(40, [LockedPiece::Empty; 10]);
             self.mode = GameMode::Playing(PlayMode::new(
@@ -719,6 +844,7 @@ impl<'a> Game<'a> {
             self.mode = GameMode::Blank;
             self.mode = GameMode::Title(TitleMode::new(self.data.background_man));
             self.data.dirty_screen = true;
+            self.data.next_box.hide();
             return;
         }
 
@@ -772,6 +898,7 @@ impl<'a> Game<'a> {
                 dirty_screen: true,
                 level: 0,
                 bag: PieceBag::new(),
+                next_box: NextBox::new(oam)
             },
             mode: GameMode::Title(TitleMode::new(background_man)),
         }
@@ -862,10 +989,13 @@ fn gen_piece_tile_data(index: u8) -> [u16; 16] {
 
 const SOLID_TILE: u16 = 7;
 const BLANK_TILE: u16 = 8;
+const VERT_BORDER_TILE: u16 = 9;
+const HORZ_BORDER_TILE: u16 = 10;
+const CORNER_TILE: u16 = 11;
 
 fn get_global_tileset() -> &'static TileSet<'static> {
     static GLOBAL_TILESET: InitOnce<TileSet<'static>> = InitOnce::new();
-    static mut TILESTORE: SmallVec<[u16; 16 * 9]> = SmallVec::new_const();
+    static mut TILESTORE: SmallVec<[u16; 16 * 12]> = SmallVec::new_const();
     fn gen_global_tileset() -> TileSet<'static> {
         let tiles = unsafe { &mut TILESTORE };
         for i in 0..7 {
@@ -873,6 +1003,9 @@ fn get_global_tileset() -> &'static TileSet<'static> {
         }
         tiles.resize(tiles.len() + 16, 0x3333);
         tiles.resize(tiles.len() + 16, 0x0);
+        tiles.extend_from_slice(include_u16_array!("../data/gfx/vert_border.bin"));
+        tiles.extend_from_slice(include_u16_array!("../data/gfx/horz_border.bin"));
+        tiles.extend_from_slice(include_u16_array!("../data/gfx/corner.bin"));
         TileSet::new(u16_slice_as_u8(tiles), TileFormat::FourBpp)
     }
 
